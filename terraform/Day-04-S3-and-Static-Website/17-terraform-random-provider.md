@@ -1,0 +1,260 @@
+# Day 04 — Terraform Random Provider
+
+> The `random` provider generates unique values (hex IDs, strings, passwords, UUIDs) so you never have to guess a globally unique S3 bucket name again.
+
+## Learning Objectives
+- Explain why a second provider is needed alongside `aws`.
+- Declare and use the `hashicorp/random` provider.
+- Generate a random ID with `random_id` and read its `.hex`, `.dec`, `.b64_url`, `.b64_std` formats.
+- Interpolate a random value into an S3 bucket name.
+
+## Prerequisites
+- Completed the previous lesson (S3 bucket create and upload).
+- Terraform 1.x, AWS credentials configured.
+- A local `myfile.txt` to upload.
+
+## Concept (plain English, beginner friendly)
+Some resource names must be **globally unique** — S3 bucket names are the classic example. Passwords, tokens and IDs have the same problem. Guessing by hand is trial and error.
+
+The **random provider** solves this. It is a "logical" provider: it talks to no cloud API, it just produces values and stores them in Terraform state. That last part matters — because the value is in state, it stays **stable** across runs. Terraform will not rename your bucket on every apply.
+
+Resource types available include `random_id`, `random_uuid`, `random_string`, `random_integer`, `random_password`, `random_bytes`, and `random_shuffle`.
+
+`random_id` with `byte_length = 8` produces 8 random bytes, exposed in several encodings:
+
+| Attribute | Example value | Notes |
+|---|---|---|
+| `.hex` | `a1b2c3d4e5f67890` | 2 chars per byte; safest for bucket names |
+| `.dec` | `12345678901234567890` | decimal integer string |
+| `.b64_url` | `r8Y8Q4z8Q2w8Qw` | URL-safe base64 |
+| `.b64_std` | `rj-QzbK9Q2aw` | standard base64 (can contain `+` `/` `=`) |
+
+For S3 bucket names use **`.hex`** — base64 can include uppercase letters and symbols that bucket names disallow.
+
+**Changing it later:** `keepers` controls regeneration. If you change a value inside `keepers`, a new random value is produced (and, for a bucket name, that means the bucket is replaced and its contents lost). Leave `keepers` out if you never want it to change.
+
+## Step-by-Step Practical
+
+1. Set up the project.
+
+```bash
+mkdir -p terraform-random
+cd terraform-random
+echo "Hello World" > myfile.txt
+```
+
+2. Declare **both** providers in `main.tf`.
+
+```hcl
+# main.tf
+
+terraform {
+  required_version = ">= 1.5.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "ap-northeast-1"
+}
+
+# ---------------------------------------------------------------
+# 1. Generate a random ID (8 random bytes -> 16 hex characters)
+# ---------------------------------------------------------------
+resource "random_id" "rand_id" {
+  byte_length = 8
+}
+
+# ---------------------------------------------------------------
+# 2. Use the random ID inside the (globally unique) bucket name
+# ---------------------------------------------------------------
+resource "aws_s3_bucket" "demo_bucket" {
+  bucket = "demo-bucket-${random_id.rand_id.hex}"
+
+  tags = {
+    Name      = "demo-bucket"
+    ManagedBy = "terraform"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "demo_bucket" {
+  bucket = aws_s3_bucket.demo_bucket.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# ---------------------------------------------------------------
+# 3. Upload a local file as an object
+# ---------------------------------------------------------------
+resource "aws_s3_object" "my_file" {
+  bucket       = aws_s3_bucket.demo_bucket.bucket
+  key          = "mydata.txt"
+  source       = "myfile.txt"
+  etag         = filemd5("myfile.txt")
+  content_type = "text/plain"
+}
+```
+
+3. Add `outputs.tf` so you can see every format the random ID offers.
+
+```hcl
+# outputs.tf
+
+output "random_id_hex" {
+  description = "Random ID (hex format)"
+  value       = random_id.rand_id.hex
+}
+
+output "random_id_dec" {
+  description = "Random ID (decimal format)"
+  value       = random_id.rand_id.dec
+}
+
+output "random_id_b64_url" {
+  description = "Random ID (URL-safe base64)"
+  value       = random_id.rand_id.b64_url
+}
+
+output "bucket_name" {
+  description = "Final bucket name including the random suffix"
+  value       = aws_s3_bucket.demo_bucket.bucket
+}
+```
+
+4. Optional extras worth trying — a readable random string and a password.
+
+```hcl
+# extras.tf (optional)
+
+resource "random_string" "suffix" {
+  length  = 6
+  special = false
+  upper   = false # lowercase only, safe for bucket names
+}
+
+resource "random_password" "db" {
+  length           = 20
+  special          = true
+  override_special = "!#$%*_-"
+}
+
+output "random_string_suffix" {
+  value = random_string.suffix.result
+}
+
+output "db_password" {
+  value     = random_password.db.result
+  sensitive = true # keeps it out of normal CLI output
+}
+```
+
+Anything generated by `random_password` is stored **in plaintext in the state file**. Treat state as a secret: use a remote backend with encryption, and never commit `terraform.tfstate` to git.
+
+5. Run the workflow.
+
+```bash
+terraform init      # downloads BOTH providers: aws and random
+terraform validate
+terraform plan
+terraform apply     # type: yes
+```
+
+6. Read a single output value.
+
+```bash
+terraform output random_id_hex
+terraform output -raw bucket_name
+terraform output -raw db_password   # sensitive values need -raw
+```
+
+## Expected Output
+
+`terraform init`:
+
+```text
+- Installing hashicorp/aws v5.x.x...
+- Installing hashicorp/random v3.x.x...
+
+Terraform has been successfully initialized!
+```
+
+`terraform apply`:
+
+```text
+Plan: 3 to add, 0 to change, 0 to destroy.
+
+Do you want to perform these actions?
+  Enter a value: yes
+
+Apply complete! Resources: 3 added, 0 changed, 0 destroyed.
+
+Outputs:
+
+bucket_name       = "demo-bucket-a1b2c3d4e5f67890"
+random_id_b64_url = "obLD1OX2eJA"
+random_id_dec     = "11647051514953101968"
+random_id_hex     = "a1b2c3d4e5f67890"
+```
+
+(Your values will differ — that is the point.)
+
+## Verification
+1. S3 Console -> **Buckets** -> a bucket named `demo-bucket-<random hex>` in your region.
+2. Open it -> **Objects** -> `mydata.txt` present.
+3. Confirm stability — the random value must **not** change on a second run:
+
+```bash
+terraform apply    # expect: No changes. Your infrastructure matches the configuration.
+terraform output random_id_hex   # same value as before
+```
+
+4. Inspect the generated resource in state:
+
+```bash
+terraform state show random_id.rand_id
+```
+
+## Cleanup
+
+```bash
+terraform destroy   # type: yes
+```
+
+```text
+Destroy complete! Resources: 3 destroyed.
+```
+
+## Common Errors & Fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| `Provider registry.terraform.io/hashicorp/random: required by this configuration but no version is selected` | Added `random` after the first `init` | Re-run `terraform init` (add `-upgrade` if needed) |
+| `Reference to undeclared resource "random_id"` | `random` missing from `required_providers`, or a typo in the resource label | Declare the provider; check `random_id.rand_id` spelling |
+| `InvalidBucketName` when using `.b64_std` / `.b64_url` | base64 can contain uppercase and `+ / = -` | Use `.hex`, or `random_string` with `upper = false, special = false` |
+| Bucket name too long | Long prefix + long random suffix exceeds 63 chars | Shorten the prefix or use `byte_length = 4` |
+| Terraform wants to replace the bucket on every apply | A value in `keepers` changes each run (e.g. `timestamp()`) | Remove `keepers`, or key it on something stable |
+| Random value regenerated and bucket recreated (data lost) | `random_id` was tainted, or state was deleted/recreated | Keep state safe in a remote backend; empty buckets before intentional replacement |
+| `Output refers to sensitive values` | Outputting a `random_password` without marking it | Add `sensitive = true` to the output |
+| `byte_length` must be at least 1 | `byte_length = 0` | Use 4 or 8 |
+
+## Key Takeaways
+- The random provider auto-generates unique values so you avoid manual trial and error.
+- Declare every provider you use in `required_providers`, then re-run `terraform init`.
+- `random_id.<name>.hex` is the right format for S3 bucket names.
+- Values are stored in state, so they stay stable across applies — `keepers` is what forces regeneration.
+- Useful for bucket names, passwords, IDs and tokens.
+- State can contain secrets: store it safely (local with care, or an encrypted remote backend), and never commit it.
+
+## Next: [Project — Host a Static Website Using Terraform](./20-host-static-website.md)
